@@ -267,10 +267,13 @@ pii_processor = PIIProcessor()
 
 # API Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "https://api.openai.com/v1")
+LLM_CHAT_PATH = os.getenv("LLM_CHAT_PATH", "/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
+LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
 
-# HTTP client for API calls
-http_client = httpx.AsyncClient(timeout=60.0)
+# HTTP client for API calls (reused for streaming)
+http_client = httpx.AsyncClient(base_url=LLM_API_BASE_URL, timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT))
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -278,14 +281,46 @@ async def shutdown_event():
     await http_client.aclose()
     pii_processor.cleanup()
 
+def dpdp_error_response(detail: str, status_code: int = 500):
+    """Return a DPDP-compliant error response."""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": detail,
+            "dpdp_compliance": {
+                "sections": ["4", "8", "10"],
+                "note": "Request blocked to protect personal data and ensure DPDP compliance."
+            }
+        }
+    )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
         "c_bridge_initialized": pii_processor.c_bridge.initialized,
+        "llm_api_base_url": LLM_API_BASE_URL,
         "openai_key": bool(OPENAI_API_KEY)
     }
+
+
+@app.post("/v1/session/create")
+async def create_session_endpoint():
+    """Create a new session ID for explicit client session control."""
+    session_id = create_session()
+    ttl = int(os.getenv("SESSION_TTL", "3600"))
+    return {"session_id": session_id, "ttl_seconds": ttl}
+
+
+@app.get("/v1/status/{session_id}")
+async def session_status(session_id: str):
+    """Get vault session statistics."""
+    stats = get_global_vault().get_session_stats(session_id)
+    if stats.get("counter", 0) == 0 and stats.get("tokens", 0) == 0:
+        return dpdp_error_response("Session not found", status_code=404)
+    return {"session_id": session_id, "stats": stats}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -311,10 +346,21 @@ async def chat_completions(request: Request):
         stream = body.get("stream", False)
 
         if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            return dpdp_error_response(
+                "LLM API key not configured. Set OPENAI_API_KEY in the .env file.",
+                status_code=500
+            )
 
-        # Create session for this request
-        session_id = create_session()
+        # Determine session ID (support client-provided session for explicit reuse)
+        header_session_id = request.headers.get("X-Sovereign-Session-ID")
+        if header_session_id:
+            stats = get_global_vault().get_session_stats(header_session_id)
+            if stats.get("counter", 0) > 0:
+                session_id = header_session_id
+            else:
+                session_id = create_session()
+        else:
+            session_id = create_session()
 
         # Process messages for PII with fail-safe mode
         processed_messages = []
@@ -344,9 +390,9 @@ async def chat_completions(request: Request):
                     if session_id:
                         clear_session(session_id)
 
-                    raise HTTPException(
-                        status_code=400,
-                        detail="PII processing failed - request blocked for privacy protection"
+                    return dpdp_error_response(
+                        "PII processing failed - request blocked for privacy protection.",
+                        status_code=400
                     )
             else:
                 processed_messages.append(message)
@@ -366,21 +412,24 @@ async def chat_completions(request: Request):
 
         # Handle streaming vs regular responses
         if stream:
+            response_session_id = header_session_id or session_id
             return StreamingResponse(
                 stream_openai_response(api_request, headers, session_id),
-                media_type="text/plain"
+                media_type="text/plain",
+                headers={"X-Sovereign-Session-ID": response_session_id}
             )
         else:
             # Regular response
             response = await http_client.post(
-                "https://api.openai.com/v1/chat/completions",
+                LLM_CHAT_PATH,
                 json=api_request,
                 headers=headers
             )
 
             if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code,
-                                  detail=f"OpenAI API error: {response.text}")
+                # Return a clean DPDP-compliant error instead of raw traceback
+                error_msg = f"Upstream LLM error (status {response.status_code})"
+                return dpdp_error_response(error_msg, status_code=response.status_code)
 
             api_response = response.json()
 
@@ -392,19 +441,23 @@ async def chat_completions(request: Request):
                         rehydrated_content = pii_processor.rehydrate_text(original_content, session_id)
                         choice["message"]["content"] = rehydrated_content
 
+            # Response should include the session used (if any)
+            response_session_id = header_session_id or session_id
+
             # Zero-trust cleanup: Clear vault immediately
             clear_session(session_id)
             session_id = None
 
-            return JSONResponse(content=api_response)
+            return JSONResponse(content=api_response, headers={"X-Sovereign-Session-ID": response_session_id})
 
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return dpdp_error_response("Invalid JSON payload", status_code=400)
     except Exception as e:
         # Clean up vault even on error
         if session_id:
             clear_session(session_id)
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        # Do not expose internal exception details
+        return dpdp_error_response("Internal server error", status_code=500)
 
 
 async def stream_openai_response(api_request: dict, headers: dict, session_id: str) -> AsyncGenerator[str, None]:
@@ -419,13 +472,20 @@ async def stream_openai_response(api_request: dict, headers: dict, session_id: s
     try:
         async with http_client.stream(
             "POST",
-            "https://api.openai.com/v1/chat/completions",
+            LLM_CHAT_PATH,
             json=api_request,
             headers=headers
         ) as response:
             if response.status_code != 200:
                 error_text = await response.aread()
-                yield f"data: {{\"error\": \"OpenAI API error: {error_text.decode()}\"}}\n\n"
+                payload = {
+                    "error": f"Upstream LLM error (status {response.status_code})",
+                    "dpdp_compliance": {
+                        "sections": ["4", "8", "10"],
+                        "note": "Request blocked to protect personal data."
+                    }
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
                 return
 
             buffer = ""

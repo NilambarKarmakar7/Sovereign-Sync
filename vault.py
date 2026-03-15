@@ -6,6 +6,7 @@ Thread-safe in-memory vault for PII tokenization and rehydration.
 Uses session IDs to prevent data mixing between concurrent requests.
 """
 
+import os
 import threading
 from typing import Dict, Optional
 from uuid import uuid4
@@ -23,8 +24,9 @@ class PrivacyVault:
     def __init__(self):
         self._vaults: Dict[str, Dict[str, str]] = {}
         self._token_counters: Dict[str, int] = {}
+        self._session_meta: Dict[str, float] = {}
         self._lock = threading.RLock()  # Reentrant lock for thread safety
-        self._session_timeout = 3600  # 1 hour session timeout
+        self._session_timeout = int(os.getenv("SESSION_TTL", "3600"))
 
     def create_session(self) -> str:
         """
@@ -37,6 +39,9 @@ class PrivacyVault:
         with self._lock:
             self._vaults[session_id] = {}
             self._token_counters[session_id] = 1000
+            self._session_meta[session_id] = time.time()
+        # Clean up expired sessions opportunistically
+        self.cleanup_expired_sessions()
         return session_id
 
     def tokenize(self, text: str, pii_type: str, session_id: str) -> tuple[str, str]:
@@ -95,6 +100,8 @@ class PrivacyVault:
                 del self._vaults[session_id]
             if session_id in self._token_counters:
                 del self._token_counters[session_id]
+            if session_id in self._session_meta:
+                del self._session_meta[session_id]
 
     def get_session_stats(self, session_id: str) -> Dict[str, int]:
         """
@@ -106,24 +113,35 @@ class PrivacyVault:
         Returns:
             dict: Session statistics
         """
+        # Opportunistically clean up expired sessions
+        self.cleanup_expired_sessions()
+
         with self._lock:
             if session_id not in self._vaults:
-                return {"tokens": 0, "counter": 0}
+                return {"tokens": 0, "counter": 0, "age_seconds": None}
+
+            age = None
+            if session_id in self._session_meta:
+                age = time.time() - self._session_meta[session_id]
 
             return {
                 "tokens": len(self._vaults[session_id]),
-                "counter": self._token_counters.get(session_id, 0)
+                "counter": self._token_counters.get(session_id, 0),
+                "age_seconds": age
             }
 
     def cleanup_expired_sessions(self):
-        """
-        Clean up expired sessions (optional maintenance method).
-        This is a no-op in the current implementation as sessions
-        are explicitly managed, but could be extended for TTL.
-        """
-        # In a production system, you might want to implement
-        # session expiration based on timestamps
-        pass
+        """Clean up expired sessions based on TTL."""
+        now = time.time()
+        expired = []
+
+        with self._lock:
+            for session_id, created_at in list(self._session_meta.items()):
+                if now - created_at > self._session_timeout:
+                    expired.append(session_id)
+
+            for session_id in expired:
+                self.clear_session(session_id)
 
     def get_total_sessions(self) -> int:
         """Get total number of active sessions."""

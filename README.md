@@ -166,6 +166,10 @@ Build a **zero-trust privacy gateway** that:
 git clone https://github.com/your-org/sovereign-sync.git
 cd sovereign-sync
 
+# Copy example env and provide your API key
+cp .env.example .env
+# Edit .env to set OPENAI_API_KEY and other values
+
 # Run auto-build script
 chmod +x setup.sh
 ./setup.sh
@@ -174,7 +178,7 @@ chmod +x setup.sh
 ### Manual Setup
 ```bash
 # Install Python dependencies
-pip3 install fastapi uvicorn httpx python-multipart
+pip3 install -r requirements.txt
 
 # Install PCRE2 (Ubuntu/Debian)
 sudo apt-get install libpcre2-dev
@@ -184,6 +188,15 @@ gcc -shared -fPIC -o pii_filter.so pii_filter.c -lpcre2-8
 
 # Verify installation
 python3 -c "import ctypes; ctypes.CDLL('./pii_filter.so')"
+```
+
+### Optional: Docker
+```bash
+# Ensure .env exists (copy example)
+cp .env.example .env
+
+# Start the gateway via Docker Compose
+docker-compose up -d
 ```
 
 ## 🚀 Usage
@@ -322,6 +335,9 @@ done
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check with system stats |
+| `POST` | `/v1/session/create` | Create a new session ID (optional; auto-created otherwise) |
+| `GET` | `/v1/status/{id}` | Get session stats (token count, age) |
+| `DELETE` | `/v1/session/{id}` | Clear/expire a session vault |
 | `POST` | `/v1/chat/completions` | OpenAI API proxy with PII protection |
 
 ### Request/Response Format

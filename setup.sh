@@ -43,10 +43,17 @@ fi
 echo "✅ GCC found: $(gcc --version | head -n1)"
 
 echo ""
+echo "📦 Installing system dependencies..."
+
+# Install PCRE2 dev headers (Ubuntu/Debian)
+if command -v apt-get &> /dev/null; then
+    sudo apt-get update && sudo apt-get install -y libpcre2-dev
+fi
+
 echo "📦 Installing Python dependencies..."
 
 # Install Python requirements
-pip3 install fastapi uvicorn httpx python-multipart
+pip3 install -r requirements.txt
 
 echo "✅ Python dependencies installed"
 

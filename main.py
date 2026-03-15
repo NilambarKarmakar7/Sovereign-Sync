@@ -322,6 +322,13 @@ async def session_status(session_id: str):
         return dpdp_error_response("Session not found", status_code=404)
     return {"session_id": session_id, "stats": stats}
 
+
+@app.delete("/v1/session/{session_id}")
+async def delete_session(session_id: str):
+    """Permanently clear a session's vault."""
+    clear_session(session_id)
+    return {"session_id": session_id, "status": "cleared"}
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
@@ -353,10 +360,13 @@ async def chat_completions(request: Request):
 
         # Determine session ID (support client-provided session for explicit reuse)
         header_session_id = request.headers.get("X-Sovereign-Session-ID")
+        clear_after_response = True
+
         if header_session_id:
             stats = get_global_vault().get_session_stats(header_session_id)
             if stats.get("counter", 0) > 0:
                 session_id = header_session_id
+                clear_after_response = False
             else:
                 session_id = create_session()
         else:
@@ -414,7 +424,7 @@ async def chat_completions(request: Request):
         if stream:
             response_session_id = header_session_id or session_id
             return StreamingResponse(
-                stream_openai_response(api_request, headers, session_id),
+                stream_openai_response(api_request, headers, session_id, clear_after_response),
                 media_type="text/plain",
                 headers={"X-Sovereign-Session-ID": response_session_id}
             )
@@ -444,9 +454,10 @@ async def chat_completions(request: Request):
             # Response should include the session used (if any)
             response_session_id = header_session_id or session_id
 
-            # Zero-trust cleanup: Clear vault immediately
-            clear_session(session_id)
-            session_id = None
+            # Zero-trust cleanup: Clear vault if session was auto-generated
+            if clear_after_response:
+                clear_session(session_id)
+                session_id = None
 
             return JSONResponse(content=api_response, headers={"X-Sovereign-Session-ID": response_session_id})
 
@@ -460,15 +471,31 @@ async def chat_completions(request: Request):
         return dpdp_error_response("Internal server error", status_code=500)
 
 
-async def stream_openai_response(api_request: dict, headers: dict, session_id: str) -> AsyncGenerator[str, None]:
-    """
-    Stream OpenAI response with real-time PII rehydration.
+async def stream_openai_response(api_request: dict, headers: dict, session_id: str, clear_after_response: bool) -> AsyncGenerator[str, None]:
+    """Stream OpenAI response with real-time PII rehydration."""
 
-    Args:
-        api_request: The API request payload
-        headers: HTTP headers for the request
-        session_id: Session ID for vault access
-    """
+    partial_token_tail = ""
+
+    def _safe_rehydrate_and_yield(text: str) -> str:
+        # Avoid emitting partial tokens (e.g. "[AADHAR_123") across chunks.
+        # Keep the last incomplete token fragment for the next chunk.
+        nonlocal partial_token_tail
+
+        combined = partial_token_tail + text
+        last_open = combined.rfind("[")
+        last_close = combined.rfind("]")
+
+        # If there is an incomplete token at the end, keep it for next chunk
+        if last_open != -1 and (last_close == -1 or last_close < last_open):
+            tail = combined[last_open:]
+            output = combined[:last_open]
+        else:
+            tail = ""
+            output = combined
+
+        partial_token_tail = tail
+        return pii_processor.rehydrate_text(output, session_id)
+
     try:
         async with http_client.stream(
             "POST",
@@ -488,12 +515,15 @@ async def stream_openai_response(api_request: dict, headers: dict, session_id: s
                 yield f"data: {json.dumps(payload)}\n\n"
                 return
 
-            buffer = ""
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     data = line[6:]  # Remove "data: " prefix
 
                     if data == "[DONE]":
+                        # Emit any remaining buffered tail before closing
+                        if partial_token_tail:
+                            payload = {"choices": [{"delta": {"content": partial_token_tail}}]}
+                            yield f"data: {json.dumps(payload)}\n\n"
                         yield f"data: [DONE]\n\n"
                         break
 
@@ -503,10 +533,9 @@ async def stream_openai_response(api_request: dict, headers: dict, session_id: s
                             choice = chunk["choices"][0]
                             if "delta" in choice and "content" in choice["delta"]:
                                 content = choice["delta"]["content"]
-                                buffer += content
 
-                                # Rehydrate content in real-time
-                                rehydrated_content = pii_processor.rehydrate_text(content, session_id)
+                                # Rehydrate content in real-time (handles partial tokens)
+                                rehydrated_content = _safe_rehydrate_and_yield(content)
 
                                 # Update the chunk with rehydrated content
                                 chunk["choices"][0]["delta"]["content"] = rehydrated_content
@@ -516,8 +545,9 @@ async def stream_openai_response(api_request: dict, headers: dict, session_id: s
                         continue
 
     finally:
-        # Clean up session after streaming
-        clear_session(session_id)
+        # Clean up session after streaming if it was auto-created
+        if clear_after_response:
+            clear_session(session_id)
 
 # ============================================================================
 # MAIN

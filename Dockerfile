@@ -60,4 +60,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE 8000
 
 # Start application
-CMD ["python", "gateway/gateway.py"]
+CMD ["python", "main.py"]

@@ -2,6 +2,7 @@
  * Sovereign-Sync: C-Python Bridge for PII Detection
  * Copyright (c) 2026 - Licensed under GNU GPL v3.0
  * High-performance PII detection with Python tokenization integration
+ * Thread-safe implementation for concurrent requests
  */
 
 #include <stdio.h>
@@ -9,9 +10,6 @@
 #include <string.h>
 #include <ctype.h>
 #include "pii_filter.h"
-
-/* Global state */
-static int initialized = 0;
 
 /* Simple pattern matching functions (no external regex dependency) */
 
@@ -111,9 +109,9 @@ static int is_email_pattern(const char *str, int len) {
     return 1;
 }
 
-/* Detect PII in text and return matches */
+/* Detect PII in text and return matches - Thread-safe, no global state */
 pii_match_t* pii_scanner_detect(const char *text, int *num_matches) {
-    if (!initialized || !text) {
+    if (!text) {
         *num_matches = 0;
         return NULL;
     }
@@ -221,13 +219,12 @@ const char* pii_type_name(int pii_type) {
     }
 }
 
-/* Initialize scanner */
+/* Initialize scanner - No-op for thread safety */
 int pii_scanner_init(void) {
-    initialized = 1;
     return 1;
 }
 
-/* Cleanup scanner */
+/* Cleanup scanner - No-op for thread safety */
 void pii_scanner_cleanup(void) {
-    initialized = 0;
+    /* No global state to clean up */
 }

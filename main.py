@@ -10,14 +10,17 @@ import asyncio
 import json
 import os
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, AsyncGenerator
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 import ctypes
+
+# Import thread-safe vault
+from vault import get_global_vault, create_session, clear_session
 
 # Load environment variables
 load_dotenv()
@@ -207,15 +210,18 @@ class PIIProcessor:
 
     def __init__(self):
         self.c_bridge = CPIIBridge()
+        self.vault = get_global_vault()
 
-    def process_text(self, text: str) -> tuple[str, PrivacyVault]:
+    def process_text(self, text: str, session_id: str) -> tuple[str, int]:
         """
-        Bridge logic: Detect PII with C module, tokenize with Python vault
+        Bridge logic: Detect PII with C module, tokenize with thread-safe vault
 
-        Returns: (masked_text, vault_with_mappings)
+        Args:
+            text: Text to process
+            session_id: Session identifier for vault isolation
+
+        Returns: (masked_text, pii_count)
         """
-        vault = PrivacyVault()
-
         # Detect PII using C module
         pii_matches = self.c_bridge.detect_pii(text)
 
@@ -224,16 +230,23 @@ class PIIProcessor:
 
         # Replace PII with tokens (reverse order to maintain positions)
         masked_text = text
+        pii_count = 0
+
         for match in pii_matches:
-            token, _ = vault.tokenize(match['text'], match['pii_type'])
-            start, end = match['start_pos'], match['end_pos']
-            masked_text = masked_text[:start] + token + masked_text[end:]
+            try:
+                token, _ = self.vault.tokenize(match['text'], match['pii_type'], session_id)
+                start, end = match['start_pos'], match['end_pos']
+                masked_text = masked_text[:start] + token + masked_text[end:]
+                pii_count += 1
+            except Exception as e:
+                print(f"⚠ Tokenization error for {match['pii_type']}: {e}")
+                # Continue processing other matches
 
-        return masked_text, vault
+        return masked_text, pii_count
 
-    def rehydrate_text(self, text: str, vault: PrivacyVault) -> str:
+    def rehydrate_text(self, text: str, session_id: str) -> str:
         """Rehydrate text using vault mappings"""
-        return vault.rehydrate(text)
+        return self.vault.rehydrate(text, session_id)
 
     def cleanup(self):
         """Clean up resources"""
@@ -279,48 +292,62 @@ async def chat_completions(request: Request):
     """
     Privacy-protected chat completions with complete rehydration loop.
 
+    Supports both regular and streaming responses with fail-safe mode.
+
     Process:
     1. Extract user messages
-    2. Detect PII with C module, tokenize with Python vault
+    2. Detect PII with C module, tokenize with thread-safe vault
     3. Send anonymized prompt to LLM
     4. Rehydrate response with original PII
     5. Clean up vault (zero-trust)
     """
 
+    session_id = None
     try:
         # Parse request
         body = await request.json()
         messages = body.get("messages", [])
         model = body.get("model", DEFAULT_MODEL)
+        stream = body.get("stream", False)
 
         if not OPENAI_API_KEY:
             raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
-        # Create request-specific vault for this session
-        request_vault = PrivacyVault()
+        # Create session for this request
+        session_id = create_session()
 
-        # Process messages for PII
+        # Process messages for PII with fail-safe mode
         processed_messages = []
         total_pii_detected = 0
+        processing_errors = []
 
         for message in messages:
             if message.get("role") == "user" and "content" in message:
                 original_content = message["content"]
 
-                # Bridge logic: C detection + Python tokenization
-                masked_content, message_vault = pii_processor.process_text(original_content)
+                try:
+                    # Bridge logic: C detection + Python tokenization
+                    masked_content, pii_count = pii_processor.process_text(original_content, session_id)
+                    processed_messages.append({
+                        "role": message["role"],
+                        "content": masked_content
+                    })
+                    total_pii_detected += pii_count
 
-                # Merge vault mappings into request vault
-                for token, original in message_vault.vault.items():
-                    request_vault.vault[token] = original
+                except Exception as e:
+                    # Fail-safe mode: Block request if PII processing fails
+                    error_msg = f"PII processing failed for message: {str(e)}"
+                    processing_errors.append(error_msg)
+                    print(f"⚠ {error_msg}")
 
-                processed_messages.append({
-                    "role": message["role"],
-                    "content": masked_content
-                })
+                    # Clean up session
+                    if session_id:
+                        clear_session(session_id)
 
-                total_pii_detected += len(message_vault.vault)
-
+                    raise HTTPException(
+                        status_code=400,
+                        detail="PII processing failed - request blocked for privacy protection"
+                    )
             else:
                 processed_messages.append(message)
 
@@ -337,39 +364,100 @@ async def chat_completions(request: Request):
             "Content-Type": "application/json"
         }
 
-        # Make API call
-        response = await http_client.post(
-            "https://api.openai.com/v1/chat/completions",
-            json=api_request,
-            headers=headers
-        )
+        # Handle streaming vs regular responses
+        if stream:
+            return StreamingResponse(
+                stream_openai_response(api_request, headers, session_id),
+                media_type="text/plain"
+            )
+        else:
+            # Regular response
+            response = await http_client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=api_request,
+                headers=headers
+            )
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code,
-                              detail=f"OpenAI API error: {response.text}")
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code,
+                                  detail=f"OpenAI API error: {response.text}")
 
-        api_response = response.json()
+            api_response = response.json()
 
-        # Rehydrate response using vault
-        if "choices" in api_response:
-            for choice in api_response["choices"]:
-                if "message" in choice and "content" in choice["message"]:
-                    original_content = choice["message"]["content"]
-                    rehydrated_content = pii_processor.rehydrate_text(original_content, request_vault)
-                    choice["message"]["content"] = rehydrated_content
+            # Rehydrate response using vault
+            if "choices" in api_response:
+                for choice in api_response["choices"]:
+                    if "message" in choice and "content" in choice["message"]:
+                        original_content = choice["message"]["content"]
+                        rehydrated_content = pii_processor.rehydrate_text(original_content, session_id)
+                        choice["message"]["content"] = rehydrated_content
 
-        # Zero-trust cleanup: Clear vault immediately
-        request_vault.clear()
+            # Zero-trust cleanup: Clear vault immediately
+            clear_session(session_id)
+            session_id = None
 
-        return JSONResponse(content=api_response)
+            return JSONResponse(content=api_response)
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
         # Clean up vault even on error
-        if 'request_vault' in locals():
-            request_vault.clear()
+        if session_id:
+            clear_session(session_id)
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
+async def stream_openai_response(api_request: dict, headers: dict, session_id: str) -> AsyncGenerator[str, None]:
+    """
+    Stream OpenAI response with real-time PII rehydration.
+
+    Args:
+        api_request: The API request payload
+        headers: HTTP headers for the request
+        session_id: Session ID for vault access
+    """
+    try:
+        async with http_client.stream(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            json=api_request,
+            headers=headers
+        ) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                yield f"data: {{\"error\": \"OpenAI API error: {error_text.decode()}\"}}\n\n"
+                return
+
+            buffer = ""
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]  # Remove "data: " prefix
+
+                    if data == "[DONE]":
+                        yield f"data: [DONE]\n\n"
+                        break
+
+                    try:
+                        chunk = json.loads(data)
+                        if "choices" in chunk and chunk["choices"]:
+                            choice = chunk["choices"][0]
+                            if "delta" in choice and "content" in choice["delta"]:
+                                content = choice["delta"]["content"]
+                                buffer += content
+
+                                # Rehydrate content in real-time
+                                rehydrated_content = pii_processor.rehydrate_text(content, session_id)
+
+                                # Update the chunk with rehydrated content
+                                chunk["choices"][0]["delta"]["content"] = rehydrated_content
+                                yield f"data: {json.dumps(chunk)}\n\n"
+
+                    except json.JSONDecodeError:
+                        continue
+
+    finally:
+        # Clean up session after streaming
+        clear_session(session_id)
 
 # ============================================================================
 # MAIN

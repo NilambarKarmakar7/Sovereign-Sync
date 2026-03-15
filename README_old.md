@@ -2,9 +2,8 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![DPDP Act 2023](https://img.shields.io/badge/DPDP--Act--2023-Compliant-green.svg)](https://www.meity.gov.in/writereaddata/files/Digital%20Personal%20Data%20Protection%20Act%202023.pdf)
-[![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://docs.docker.com/compose/)
 
-**FOSS Hack 2026 Submission** - Production-ready local privacy gateway intercepting LLM API calls to redact PII and ensure compliance with India's Digital Personal Data Protection (DPDP) Act 2023.
+**FOSS Hack 2026 Submission** - High-performance local privacy gateway intercepting LLM API calls to redact PII and ensure compliance with India's Digital Personal Data Protection (DPDP) Act 2023.
 
 ## 🎯 Mission
 
@@ -12,13 +11,12 @@ Build a **zero-trust privacy gateway** that:
 - Intercepts OpenAI/Gemini API calls
 - Redacts sensitive Indian identity data (Aadhar, PAN, bank details)
 - Uses sub-millisecond C/PCRE2 regex filtering
-- Implements request-scoped in-memory vaults with garbage collection
-- Integrates Microsoft Presidio for contextual PII detection
-- Maintains full DPDP Act 2023 compliance with transparency headers
+- Implements session-based in-memory vaults
+- Maintains full DPDP Act 2023 compliance
 
 ## 🏗️ Architecture
 
-### Hybrid Three-Tier Design
+### Hybrid Two-Tier Design
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -27,30 +25,20 @@ Build a **zero-trust privacy gateway** that:
                               │
                               ▼
         ┌─────────────────────────────────────────────┐
-        │        Tier 3: FastAPI Gateway              │
+        │        Tier 2: FastAPI Gateway              │
         │  ┌───────────────────────────────────────┐  │
-        │  │  Request-Scoped Sessions              │  │
-        │  │  DPDP Compliance Headers              │  │
-        │  │  Fail-Safe Error Handling             │  │
-        │  │  Response Rehydration                 │  │
-        │  └───────────────────────────────────────┘  │
-        │                    │                         │
-        │                    ▼                         │
-        │  ┌───────────────────────────────────────┐  │
-        │  │ Tier 2: Contextual PII Detection      │  │
-        │  │ ┌─────────────────────────────────┐   │  │
-        │  │ │ Microsoft Presidio Analyzer     │   │  │
-        │  │ ├─ PERSON, ORG, GPE, LOCATION     │   │  │
-        │  │ ├─ EMAIL, PHONE_NUMBER            │   │  │
-        │  │ ├─ High-confidence filtering       │   │  │
-        │  │ └─────────────────────────────────┘   │  │
+        │  │  Session Manager (UUID-based)         │  │
+        │  │  Request/Response Orchestration       │  │
+        │  │  In-Memory Vault (Token ↔ PII)       │  │
+        │  │  TTL Management & Cleanup             │  │
+        │  │  Contextual PII Detection (spaCy)     │  │
         │  └───────────────────────────────────────┘  │
         │                    │                         │
         │                    ▼                         │
         │  ┌───────────────────────────────────────┐  │
         │  │ Tier 1: C/PCRE2 PII Scanner           │  │
         │  │ ┌─────────────────────────────────┐   │  │
-        │  │ │ Regex Patterns (Compiled Cache) │   │  │
+        │  │ │ Regex Patterns (Compiled Cache) │   │
         │  │ ├─ Aadhar (12 digits)             │   │  │
         │  │ ├─ PAN (10-char: AAAAA9999A)      │   │  │
         │  │ ├─ Bank Account (9-18 digits)     │   │  │
@@ -81,12 +69,11 @@ Build a **zero-trust privacy gateway** that:
                              │
                              ▼
         ┌─────────────────────────────────────────────┐
-        │  Tier 3: Response Rehydration               │
+        │  Tier 2: Response Rehydration               │
         │  ┌───────────────────────────────────────┐  │
-        │  │ Pattern Matching: [PII_TYPE_xxxx]    │  │
+        │  │ Pattern Matching: [PII_TYPE_n]        │  │
         │  │ Vault Lookup (O(1) hash)              │  │
         │  │ Original Data Restoration              │  │
-        │  │ DPDP Compliance Header Injection       │  │
         │  └───────────────────────────────────────┘  │
         │                    │                         │
         └────────────────────┼─────────────────────────┘
@@ -105,83 +92,59 @@ Build a **zero-trust privacy gateway** that:
 - **Purpose**: PII redaction for LLM compliance only
 - **No Secondary Uses**: Data not sold, shared, or used for analytics
 - **Explicit Consent**: Session creation = user consent
-- **Fail-Safe Blocking**: Requests blocked if PII threshold exceeded
 
 ### Section 8: Data Minimization
 - **Necessary Data Only**: Extracts Aadhar, PAN, bank details, names, addresses
-- **Storage Limitation**: 5-minute TTL per request, immediate cleanup
+- **Storage Limitation**: 30-minute TTL, automatic cleanup
 - **Proportionality**: Minimal retention for redaction/rehydration
-- **Garbage Collection**: Background cleanup of expired sessions
 
 ### Section 10: Data Security
 - **In-Memory Only**: No disk writes, volatile storage
 - **Secure Cleanup**: Memory overwritten before deallocation
 - **Session Isolation**: Independent vaults per user session
-- **Request Scoping**: Unique tokens per request prevent leakage
 
 ## 🚀 Features
 
-### Tier 1: Enhanced C/PCRE2 Regex Scanner
+### Tier 1: C/PCRE2 Regex Scanner
 - **Sub-millisecond latency** for pattern matching
 - **Compiled regex cache** for optimal performance
 - **Indian identity validation** (Aadhar checksum, PAN format)
-- **Thread-safe** operation with memory safety
-- **Multiple pattern support** with priority ordering
+- **Thread-safe** operation
 
-### Tier 2: Microsoft Presidio Contextual Detection
-- **High-accuracy NER** for fuzzy PII detection
-- **PERSON, ORG, GPE, LOCATION** entity recognition
-- **EMAIL, PHONE_NUMBER** pattern detection
-- **Confidence scoring** with threshold filtering
-- **Production-ready** enterprise-grade analyzer
+### Tier 2: Python FastAPI Gateway
+- **Session management** with UUID-based vaults
+- **Contextual PII detection** using spaCy NER
+- **Fail-safe blocking** for high PII content
+- **Automatic cleanup** of expired sessions
 
-### Tier 3: Advanced FastAPI Gateway
-- **Request-scoped sessions** with unique tokenization
-- **Background garbage collection** for expired vaults
-- **DPDP compliance headers** with transparency reporting
-- **Fail-safe error handling** (fail-closed on failures)
-- **Asynchronous processing** with context managers
-
-### Production-Ready Vault System
-- **Request-scoped tokens**: Unique per request to prevent leakage
-- **Immediate cleanup**: Vault wiped after response sent
-- **TTL enforcement**: 5-minute default with configurable limits
+### Enhanced Vault System
+- **Token mapping**: `[PERSON_1]` ↔ `"John Doe"`
+- **TTL enforcement**: 30-minute session lifetime
 - **Secure wiping**: Memory overwritten on cleanup
-- **Category tracking**: Comprehensive PII classification
+- **Category tracking**: PERSON, ORG, GPE, ADDRESS, etc.
 
 ## 📋 Prerequisites
 
 - **C Compiler**: GCC 9+ or Clang (with PCRE2 development headers)
 - **CMake**: 3.10+
 - **Python**: 3.8+
-- **Docker**: 20.10+ (optional, for containerized deployment)
+- **spaCy**: `python -m spacy download en_core_web_sm`
 
 ## 🛠️ Installation
 
-### Option 1: Docker Compose (Recommended)
-
-```bash
-git clone https://github.com/your-org/sovereign-sync.git
-cd sovereign-sync
-docker-compose up -d
-```
-
-The gateway will be available at `http://localhost:8000`
-
-### Option 2: Manual Installation
-
-#### 1. Clone Repository
+### 1. Clone Repository
 ```bash
 git clone https://github.com/your-org/sovereign-sync.git
 cd sovereign-sync
 ```
 
-#### 2. Install Python Dependencies
+### 2. Install Python Dependencies
 ```bash
 pip install -r requirements.txt
+python -m spacy download en_core_web_sm
 ```
 
-#### 3. Build C Library
+### 3. Build C Library
 ```bash
 # Linux/macOS
 mkdir build && cd build
@@ -194,26 +157,16 @@ cmake -G "MinGW Makefiles" ..
 mingw32-make
 ```
 
-#### 4. Run Tests
+### 4. Run Tests
 ```bash
 cd build
 ctest
-```
-
-#### 5. Start Gateway
-```bash
-cd gateway
-python gateway.py
 ```
 
 ## 🚀 Usage
 
 ### Start Gateway
 ```bash
-# Using Docker
-docker-compose up -d
-
-# Or manually
 cd gateway
 python gateway.py
 ```
@@ -242,42 +195,37 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 **What happens internally:**
 1. **Detection**: Identifies "John Doe" (PERSON) and "1234-5678-9012" (AADHAR)
-2. **Redaction**: Replaces with `[PERSON_a1b2c3d4]` and `[AADHAR_e5f6g7h8]`
-3. **Vault Storage**: Maps tokens to original values (request-scoped)
+2. **Redaction**: Replaces with `[PERSON_1]` and `[AADHAR_1000]`
+3. **Vault Storage**: Maps tokens to original values
 4. **API Call**: Sends redacted request to OpenAI
 5. **Rehydration**: Restores original PII in response
-6. **Cleanup**: Vault immediately wiped after response sent
 
 ### Check Session Status
 ```bash
 curl http://localhost:8000/v1/status/abc123...
 ```
 
-### Health Check
+### Invalidate Session
 ```bash
-curl http://localhost:8000/health
-# Response includes Presidio status, C library status, and vault stats
+curl -X POST http://localhost:8000/v1/session/abc123.../invalidate
 ```
 
 ## 🔧 Configuration
 
 ### Environment Variables
 ```bash
-export VAULT_CLEANUP_INTERVAL=60        # GC interval in seconds
-export SESSION_TTL=1800                 # Session TTL in seconds
-export MAX_PII_ENTITIES_PER_REQUEST=10  # Fail-safe threshold
-export PII_CONFIDENCE_THRESHOLD=0.7     # NER confidence minimum
+export SESSION_TTL_MINUTES=30
+export MAX_SESSIONS=10000
+export MAX_PII_ENTITIES_PER_REQUEST=10
+export PII_CONFIDENCE_THRESHOLD=0.7
 ```
 
-### Docker Environment
-```yaml
-# docker-compose.yml
-environment:
-  - VAULT_CLEANUP_INTERVAL=60
-  - SESSION_TTL=1800
-  - MAX_PII_ENTITIES_PER_REQUEST=10
-  - PII_CONFIDENCE_THRESHOLD=0.7
-```
+### Gateway Configuration
+- **Session TTL**: 30 minutes (configurable)
+- **Max Sessions**: 10,000 concurrent
+- **Request Size Limit**: 1MB
+- **PII Threshold**: Block requests with >10 entities
+- **NER Confidence**: Minimum 0.7 for detections
 
 ## 🧪 Testing
 
@@ -293,10 +241,9 @@ ctest --verbose
 ./pii_scanner_test
 
 # Expected output:
-# ✓ Aadhar with spaces and dashes
+# ✓ Aadhar with spaces
 # ✓ PAN format validation
 # ✓ Bank account length checks
-# ✓ Multiple pattern priority
 ```
 
 ### API Testing
@@ -304,15 +251,8 @@ ctest --verbose
 # Health check
 curl http://localhost:8000/health
 
-# Test high PII blocking (should return 403)
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -d '{"messages":[{"content":"PII PII PII PII PII PII PII PII PII PII PII"}]}'
-
-# Test compliance headers
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "X-Sovereign-Session-ID: test" \
-  -d '{"messages":[{"content":"My name is John Doe"}]}'
-# Check X-DPDP-Compliance-Notice header in response
+# Create session and test PII redaction
+# (See usage examples above)
 ```
 
 ## 📊 Performance Benchmarks
@@ -320,32 +260,23 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | Component | Latency | Notes |
 |-----------|---------|-------|
 | **Regex Scanning** | < 1ms | PCRE2 JIT compiled |
-| **Presidio NER** | < 10ms | Enterprise-grade accuracy |
-| **Vault Operations** | < 0.1ms | O(1) hash table |
-| **Total Request** | < 100ms | End-to-end processing |
-| **Memory Usage** | < 50MB | Per 1000 concurrent sessions |
+| **NER Detection** | < 5ms | spaCy en_core_web_sm |
+| **Vault Lookup** | < 0.1ms | O(1) hash table |
+| **Total Request** | < 50ms | End-to-end processing |
 
 ## 🔒 Security Features
 
 ### Zero-Trust Architecture
 - **No persistent storage** of PII
-- **Request-scoped vaults** prevent cross-request leakage
-- **Immediate cleanup** after response processing
-- **Secure memory wiping** on all deallocations
+- **In-memory vaults** only during session
+- **Secure memory wiping** on cleanup
 - **Session isolation** prevents cross-contamination
 
 ### Fail-Safe Mechanisms
-- **PII threshold blocking** prevents overload (configurable)
-- **Error fail-closed** blocks requests if C/Presidio fails
-- **Request size limits** prevent DoS attacks
+- **PII threshold blocking** prevents overload
+- **Request size limits** prevent DoS
 - **Timeout enforcement** on upstream calls
-- **Graceful degradation** with fallback modes
-
-### DPDP Transparency
-- **Compliance headers** detail entities masked and reasons
-- **Audit logging** of PII detection events
-- **Session tracking** for accountability
-- **Health monitoring** for system reliability
+- **Error handling** with graceful degradation
 
 ## 📚 API Reference
 
@@ -353,43 +284,31 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check with system stats |
+| `GET` | `/health` | Health check with stats |
 | `POST` | `/v1/session/create` | Create new session |
-| `POST` | `/v1/chat/completions` | Proxy OpenAI API with PII protection |
+| `POST` | `/v1/session/{id}/invalidate` | Destroy session |
+| `POST` | `/v1/chat/completions` | Proxy OpenAI API |
 | `GET` | `/v1/status/{id}` | Session information |
 
 ### Headers
 
 - `X-Sovereign-Session-ID`: Session identifier (auto-created if missing)
-- `X-DPDP-Compliance-Notice`: JSON with masking details (response only)
 - `Content-Type`: `application/json`
-
-### Compliance Header Example
-```json
-{
-  "entities_masked": 2,
-  "categories": ["PERSON", "AADHAR"],
-  "avg_confidence": 0.85,
-  "dpdp_sections": ["4", "8"],
-  "timestamp": "2026-03-15T10:30:00Z"
-}
-```
 
 ## 🤝 Contributing
 
 1. Fork the repository
-2. Create feature branch: `git checkout -b feature/enhanced-nlp`
+2. Create feature branch: `git checkout -b feature/new-pii-detector`
 3. Add tests for new functionality
 4. Ensure DPDP compliance in changes
-5. Update documentation
-6. Submit pull request
+5. Submit pull request
 
 ### Development Guidelines
 
-- **Code Quality**: Follow PEP 8, add comprehensive docstrings
-- **Testing**: Unit tests for all components, integration tests
-- **Documentation**: Update API docs and compliance statements
-- **Security**: No external data sharing, secure memory handling
+- **Code Quality**: Follow PEP 8, add docstrings
+- **Testing**: Unit tests for all components
+- **Documentation**: Update docs for API changes
+- **Security**: No external data sharing
 - **Performance**: Profile and optimize bottlenecks
 
 ## 📄 License
@@ -402,9 +321,8 @@ This project is free software: you can redistribute it and/or modify it under th
 
 - **FOSS Hack 2026** organizers
 - **Ministry of Electronics and Information Technology (MeitY)** for DPDP Act
-- **Microsoft Presidio** team for enterprise PII detection
+- **spaCy** community for NER capabilities
 - **PCRE2** project for high-performance regex
-- **FastAPI** community for async web framework
 
 ## 📞 Support
 
@@ -414,4 +332,5 @@ This project is free software: you can redistribute it and/or modify it under th
 
 ---
 
-**Built with ❤️ for India's digital sovereignty and privacy rights under DPDP Act 2023.**
+**Built with ❤️ for India's digital sovereignty and privacy rights.**
+

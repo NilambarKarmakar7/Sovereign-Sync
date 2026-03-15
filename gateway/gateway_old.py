@@ -4,7 +4,7 @@ Copyright (c) 2026 - Licensed under GNU GPL v3.0
 
 Tier 2 orchestration layer managing request/response lifecycle with
 session-based vault system for PII redaction and rehydration.
-Enhanced with presidio-analyzer for robust contextual PII detection.
+Enhanced with contextual PII detection using spaCy NER.
 """
 
 import asyncio
@@ -24,18 +24,17 @@ from enum import Enum
 import uvicorn
 
 # Enhanced vault system
-from vault import VaultManager, SessionVault, PIICategory, generate_request_id, vault_manager, init_vault, shutdown_vault
+from vault import VaultManager, SessionVault, PIICategory
 
-# Presidio for contextual PII detection
+# spaCy for contextual PII detection
 try:
-    from presidio_analyzer import AnalyzerEngine
-    from presidio_analyzer.nlp_engine import NlpEngineProvider
-    analyzer = AnalyzerEngine()
-    PRESIDIO_AVAILABLE = True
+    import spacy
+    nlp = spacy.load("en_core_web_sm")  # Load English NER model
+    SPACY_AVAILABLE = True
 except ImportError:
-    analyzer = None
-    PRESIDIO_AVAILABLE = False
-    logging.warning("Presidio not available - contextual PII detection disabled")
+    nlp = None
+    SPACY_AVAILABLE = False
+    logging.warning("spaCy not available - contextual PII detection disabled")
 
 # ============================================================================
 # CONFIGURATION
@@ -53,7 +52,7 @@ MAX_REQUEST_SIZE = 1024 * 1024  # 1MB
 
 # PII Detection thresholds for fail-safe
 MAX_PII_ENTITIES_PER_REQUEST = 10  # Block if more than 10 entities detected
-PII_CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence for detections
+PII_CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence for NER detections
 
 # Upstream API configuration
 OPENAI_API_BASE = "https://api.openai.com/v1"
@@ -91,7 +90,7 @@ try:
         libscanner = ctypes.CDLL("../lib/libpii_scanner.so")
 except OSError as e:
     logger.error(f"Failed to load PII scanner library: {e}")
-    logger.warning("PII scanning disabled - running in fail-safe mode")
+    logger.warning("PII scanning disabled - running in passthrough mode")
     libscanner = None
 
 # Function signatures
@@ -110,12 +109,12 @@ if libscanner:
 
 
 # ============================================================================
-# CONTEXTUAL PII DETECTOR (PRESIDIO)
+# CONTEXTUAL PII DETECTOR
 # ============================================================================
 
 class ContextualPIIDetector:
     """
-    Uses Microsoft Presidio to detect contextual PII with high accuracy.
+    Uses spaCy NER to detect contextual PII (names, organizations, locations).
 
     DPDP Compliance (Section 8 - Data Minimization):
     - Only processes text for necessary entity detection
@@ -123,34 +122,28 @@ class ContextualPIIDetector:
     """
 
     def __init__(self):
-        self.analyzer = analyzer if PRESIDIO_AVAILABLE else None
+        self.nlp = nlp if SPACY_AVAILABLE else None
 
     def detect_entities(self, text: str) -> List[Tuple[str, str, float]]:
         """
-        Detect PII entities in text using Presidio.
+        Detect named entities in text.
 
-        Returns: List of (entity_text, entity_type, confidence) tuples
+        Returns: List of (entity_text, label, confidence) tuples
         """
-        if not self.analyzer or not text:
+        if not self.nlp or not text:
             return []
 
-        try:
-            results = self.analyzer.analyze(text=text, language='en')
-            entities = []
+        doc = self.nlp(text)
+        entities = []
 
-            for result in results:
-                entity_text = text[result.start:result.end]
-                entity_type = result.entity_type
-                confidence = getattr(result, 'confidence_score', 0.8)
+        for ent in doc.ents:
+            # Filter for PII-relevant entities
+            if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']:
+                # Convert spaCy confidence to our scale (simplified)
+                confidence = min(1.0, getattr(ent, 'confidence', 0.8))
+                entities.append((ent.text, ent.label_, confidence))
 
-                # Filter for PII-relevant entities
-                if entity_type in ['PERSON', 'ORG', 'GPE', 'LOCATION', 'EMAIL', 'PHONE_NUMBER']:
-                    entities.append((entity_text, entity_type, confidence))
-
-            return entities
-        except Exception as e:
-            logger.error(f"Presidio analysis error: {e}")
-            return []
+        return entities
 
     def should_block_request(self, entities: List[Tuple[str, str, float]]) -> bool:
         """
@@ -238,89 +231,84 @@ class RequestProcessor:
     """
 
     def __init__(self):
+        self.vault_manager = VaultManager()
         self.context_detector = ContextualPIIDetector()
 
-    async def process_request(self, request_body: dict, session_id: str, request_id: str) -> Tuple[dict, bool, Dict]:
+    def process_request(self, request_body: dict, session_id: str) -> Tuple[dict, bool]:
         """
         Process request: detect PII, redact, store in vault.
 
-        Returns: (redacted_body, should_block, compliance_info)
+        Returns: (redacted_body, should_block)
         """
-        async with vault_manager.get_session_vault(session_id, request_id) as vault:
-            redacted_body = request_body.copy()
-            total_pii_detected = 0
-            compliance_info = {
-                "entities_detected": 0,
-                "categories": [],
-                "confidence_scores": []
-            }
+        vault = self.vault_manager.get_vault(session_id)
+        if not vault:
+            vault = self.vault_manager.create_vault(session_id)
 
-            # Process messages for PII
-            if "messages" in redacted_body:
-                for message in redacted_body["messages"]:
-                    if "content" in message and isinstance(message["content"], str):
-                        original_content = message["content"]
+        redacted_body = request_body.copy()
+        total_pii_detected = 0
 
-                        # Step 1: Regex-based redaction (C library)
-                        scanner = PIIScanner(session_id)
-                        regex_redacted = scanner.redact(original_content)
-                        scanner.cleanup()
+        # Process messages for PII
+        if "messages" in redacted_body:
+            for message in redacted_body["messages"]:
+                if "content" in message and isinstance(message["content"], str):
+                    original_content = message["content"]
 
-                        # Step 2: Contextual PII detection (Presidio)
-                        entities = self.context_detector.detect_entities(regex_redacted)
+                    # Step 1: Regex-based redaction (C library)
+                    scanner = PIIScanner(session_id)
+                    regex_redacted = scanner.redact(original_content)
+                    scanner.cleanup()
 
-                        # Step 3: Redact contextual PII and store in vault
-                        contextual_redacted = regex_redacted
-                        for entity_text, entity_type, confidence in entities:
-                            if confidence >= PII_CONFIDENCE_THRESHOLD:
-                                # Map Presidio labels to our categories
-                                category_map = {
-                                    'PERSON': PIICategory.PERSON,
-                                    'ORG': PIICategory.ORG,
-                                    'GPE': PIICategory.GPE,
-                                    'LOCATION': PIICategory.ADDRESS,
-                                    'EMAIL': PIICategory.EMAIL,
-                                    'PHONE_NUMBER': PIICategory.PHONE
-                                }
+                    # Step 2: Contextual PII detection (spaCy NER)
+                    entities = self.context_detector.detect_entities(regex_redacted)
 
-                                category = category_map.get(entity_type, PIICategory.PERSON)
-                                token = vault.add_entry(entity_text, category, request_id)
-                                contextual_redacted = contextual_redacted.replace(entity_text, token)
-                                total_pii_detected += 1
+                    # Step 3: Redact contextual PII and store in vault
+                    contextual_redacted = regex_redacted
+                    for entity_text, label, confidence in entities:
+                        if confidence >= PII_CONFIDENCE_THRESHOLD:
+                            # Map spaCy labels to our categories
+                            category_map = {
+                                'PERSON': PIICategory.PERSON,
+                                'ORG': PIICategory.ORG,
+                                'GPE': PIICategory.GPE,
+                                'LOC': PIICategory.ADDRESS
+                            }
 
-                                # Update compliance info
-                                compliance_info["entities_detected"] += 1
-                                compliance_info["categories"].append(entity_type)
-                                compliance_info["confidence_scores"].append(confidence)
+                            category = category_map.get(label, PIICategory.UNKNOWN)
+                            token = vault.add_entry(entity_text, category, confidence)
+                            contextual_redacted = contextual_redacted.replace(entity_text, token)
+                            total_pii_detected += 1
 
-                        message["content"] = contextual_redacted
+                    message["content"] = contextual_redacted
 
-            # Fail-safe check
-            should_block = self.context_detector.should_block_request(
-                self.context_detector.detect_entities(str(request_body))
-            )
+        # Fail-safe check
+        should_block = self.context_detector.should_block_request(
+            self.context_detector.detect_entities(str(request_body))
+        )
 
-            if should_block:
-                logger.warning(f"Request blocked due to high PII count: {total_pii_detected} entities")
+        if should_block:
+            logger.warning(f"Request blocked due to high PII count: {total_pii_detected} entities")
 
-            return redacted_body, should_block, compliance_info
+        return redacted_body, should_block
 
-    async def process_response(self, response_body: dict, session_id: str, request_id: str) -> dict:
+    def process_response(self, response_body: dict, session_id: str) -> dict:
         """
         Rehydrate response using vault mappings.
         """
-        async with vault_manager.get_session_vault(session_id, request_id) as vault:
-            rehydrated_body = response_body.copy()
+        vault = self.vault_manager.get_vault(session_id)
+        if not vault:
+            return response_body
 
-            # Rehydrate messages
-            if "choices" in rehydrated_body:
-                for choice in rehydrated_body["choices"]:
-                    if "message" in choice and "content" in choice["message"]:
-                        choice["message"]["content"] = vault.rehydrate_text(
-                            choice["message"]["content"]
-                        )
+        rehydrated_body = response_body.copy()
 
-            return rehydrated_body
+        # Rehydrate messages
+        if "choices" in rehydrated_body:
+            for choice in rehydrated_body["choices"]:
+                if "message" in choice and "content" in choice["message"]:
+                    choice["message"]["content"] = vault.rehydrate_text(
+                        choice["message"]["content"]
+                    )
+
+        return rehydrated_body
 
 
 # ============================================================================
@@ -339,24 +327,23 @@ request_processor = RequestProcessor()
 @app.on_event("startup")
 async def startup_event():
     """Initialize vault cleanup background task"""
-    await init_vault()
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(VAULT_CLEANUP_INTERVAL_SECONDS)
+            request_processor.vault_manager.periodic_cleanup()
+
+    asyncio.create_task(cleanup_loop())
     logger.info("Sovereign-Sync gateway initialized")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown vault system"""
-    await shutdown_vault()
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    stats = vault_manager.get_global_stats()
+    stats = request_processor.vault_manager.get_global_stats()
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "presidio_available": PRESIDIO_AVAILABLE,
+        "spacy_available": SPACY_AVAILABLE,
         "c_library_loaded": libscanner is not None,
         **stats
     }
@@ -367,6 +354,7 @@ async def create_session() -> dict:
     """Create new privacy session"""
     try:
         session_id = str(uuid4()).replace("-", "")
+        request_processor.vault_manager.create_vault(session_id)
         return {
             "session_id": session_id,
             "ttl_minutes": SESSION_TTL_MINUTES,
@@ -375,6 +363,17 @@ async def create_session() -> dict:
     except Exception as e:
         logger.error(f"Session creation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/session/{session_id}/invalidate")
+async def invalidate_session(session_id: str):
+    """Invalidate and clear session vault"""
+    success = request_processor.vault_manager.destroy_vault(session_id)
+    if success:
+        logger.info(f"Session invalidated: {session_id}")
+        return {"status": "invalidated"}
+
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
 @app.api_route("/v1/chat/completions", methods=["POST"])
@@ -393,8 +392,7 @@ async def proxy_chat_completions(request: Request) -> Response:
     session_id = request.headers.get("X-Sovereign-Session-ID")
     if not session_id:
         session_id = str(uuid4()).replace("-", "")
-
-    request_id = generate_request_id()
+        request_processor.vault_manager.create_vault(session_id)
 
     try:
         # Read request body
@@ -405,11 +403,11 @@ async def proxy_chat_completions(request: Request) -> Response:
         request_body = json.loads(body_bytes)
 
         # Process request: detect and redact PII
-        redacted_body, should_block, compliance_info = await request_processor.process_request(
-            request_body, session_id, request_id
+        redacted_body, should_block = request_processor.process_request(
+            request_body, session_id
         )
 
-        # Fail-safe: Block if too much PII detected or if C/Presidio failed
+        # Fail-safe: Block if too much PII detected
         if should_block:
             raise HTTPException(
                 status_code=403,
@@ -422,38 +420,20 @@ async def proxy_chat_completions(request: Request) -> Response:
         upstream_response = await _forward_to_upstream(redacted_body)
 
         # Rehydrate response with original PII
-        rehydrated_response = await request_processor.process_response(
-            upstream_response, session_id, request_id
+        rehydrated_response = request_processor.process_response(
+            upstream_response, session_id
         )
-
-        # Add DPDP compliance header
-        compliance_header = json.dumps({
-            "entities_masked": compliance_info["entities_detected"],
-            "categories": list(set(compliance_info["categories"])),
-            "avg_confidence": sum(compliance_info["confidence_scores"]) / len(compliance_info["confidence_scores"]) if compliance_info["confidence_scores"] else 0,
-            "dpdp_sections": ["4", "8"],  # Purpose limitation and data minimization
-            "timestamp": datetime.utcnow().isoformat()
-        })
 
         return JSONResponse(
             content=rehydrated_response,
-            headers={
-                "X-Sovereign-Session-ID": session_id,
-                "X-DPDP-Compliance-Notice": compliance_header
-            }
+            headers={"X-Sovereign-Session-ID": session_id}
         )
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
         logger.error(f"Error processing request: {e}")
-        # Fail-closed: Block request if processing fails
-        raise HTTPException(
-            status_code=500,
-            detail="Request blocked due to processing error. "
-                   "Please try again or contact administrator. "
-                   "(Fail-safe mode activated per DPDP Act 2023)"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def _forward_to_upstream(body: dict) -> dict:
@@ -489,12 +469,11 @@ async def _forward_to_upstream(body: dict) -> dict:
 @app.get("/v1/status/{session_id}")
 async def get_session_status(session_id: str) -> dict:
     """Get session status and vault info"""
-    stats = vault_manager.get_global_stats()
-    return {
-        "session_id": session_id,
-        "active": session_id in [s for s in stats.get("active_sessions", [])],
-        **stats
-    }
+    vault = request_processor.vault_manager.get_vault(session_id)
+    if not vault:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return vault.get_stats()
 
 
 # ============================================================================

@@ -1,38 +1,57 @@
 cmake_minimum_required(VERSION 3.10)
-project(sovereign-sync C)
+project(SovereignSyncPII C)
 
-# C Standard
-set(CMAKE_C_STANDARD 99)
+# Set C standard
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3 -march=native")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O3")
 
-# PCRE2 
-find_package(PCRE2 REQUIRED)
-
-# Add source files
-set(SOURCES
-    src/pii_scanner.c
+# Add shared library
+add_library(pii_filter SHARED
+    pii_filter.c
 )
 
-# Create shared library
-add_library(pii_scanner SHARED ${SOURCES})
-
-# Link PCRE2
-target_include_directories(pii_scanner PRIVATE include)
-target_link_libraries(pii_scanner PRIVATE PCRE2::PCRE2)
-
-# Set output directory
-set_target_properties(pii_scanner PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+# Include directories
+target_include_directories(pii_filter PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Optional: Build tests
-enable_testing()
+# Platform-specific linking
+if(WIN32)
+    # Windows: Try to find regex library
+    find_library(REGEX_LIBRARY regex)
+    if(REGEX_LIBRARY)
+        target_link_libraries(pii_filter ${REGEX_LIBRARY})
+    endif()
+    set_target_properties(pii_filter PROPERTIES
+        OUTPUT_NAME "libpii_filter"
+        SUFFIX ".dll"
+    )
+else()
+    # Unix-like systems (Linux, macOS)
+    # Try PCRE2 first, fallback to regex
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PCRE2 QUIET libpcre2-8)
+        if(PCRE2_FOUND)
+            target_include_directories(pii_filter PRIVATE ${PCRE2_INCLUDE_DIRS})
+            target_link_libraries(pii_filter ${PCRE2_LIBRARIES})
+        else()
+            # Fallback to system regex
+            target_link_libraries(pii_filter regex)
+        endif()
+    else()
+        target_link_libraries(pii_filter regex)
+    endif()
 
-# PII Scanner test executable
-add_executable(pii_scanner_test tests/test_pii_scanner.c src/pii_scanner.c)
-target_include_directories(pii_scanner_test PRIVATE include)
-target_link_libraries(pii_scanner_test PRIVATE PCRE2::PCRE2)
+    set_target_properties(pii_filter PROPERTIES
+        OUTPUT_NAME "pii_filter"
+        SUFFIX ".so"
+    )
+endif()
 
-add_test(NAME PIIScannerTests COMMAND pii_scanner_test)
+# Installation
+install(TARGETS pii_filter
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)

@@ -56,8 +56,8 @@ MAX_PII_ENTITIES_PER_REQUEST = 10  # Block if more than 10 entities detected
 PII_CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence for detections
 
 # Upstream API configuration
-OPENAI_API_BASE = "https://api.openai.com/v1"
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENAI_API_BASE = "https://api.openai.com/v1"  # Legacy reference for backward compatibility
 
 
 # ============================================================================
@@ -380,7 +380,7 @@ async def create_session() -> dict:
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def proxy_chat_completions(request: Request) -> Response:
     """
-    Proxy OpenAI-compatible chat completion endpoint with enhanced PII protection.
+    Proxy Gemini-compatible chat completion endpoint with enhanced PII protection.
 
     DPDP Compliance Flow:
     1. Purpose Limitation: Only process for redaction (Section 4)
@@ -461,13 +461,13 @@ async def _forward_to_upstream(body: dict) -> dict:
     Forward request to upstream API
     (Mock implementation - replace with actual upstream calls)
     """
-    # This would normally make HTTP call to OpenAI/Gemini
+    # This would normally make HTTP call to Gemini/OpenAI
     # For demo, returning sample response
     return {
         "id": "chatcmpl-demo",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": body.get("model", "gpt-4"),
+        "model": body.get("model", "gemini-2.0-flash"),
         "choices": [
             {
                 "index": 0,

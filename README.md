@@ -10,7 +10,7 @@
 ## 🎯 Mission
 
 Build a **zero-trust privacy gateway** that:
-- Intercepts OpenAI API calls with thread-safe C/PCRE2 regex filtering
+- Intercepts Gemini API calls with thread-safe C/PCRE2 regex filtering
 - Redacts sensitive Indian identity data (Aadhar, PAN, bank details)
 - Uses sub-millisecond C pattern matching with session isolation
 - Implements request-scoped in-memory vaults with immediate cleanup
@@ -73,7 +73,7 @@ Build a **zero-trust privacy gateway** that:
                              │
                              ▼
         ┌─────────────────────────────────────────────┐
-        │       Upstream LLM API (OpenAI)             │
+        │       Upstream LLM API (Google Gemini)      │
         │       • No PII visible in logs              │
         │       • No data retention concerns          │
         │       • API audit trails don't expose data  │
@@ -168,7 +168,7 @@ cd sovereign-sync
 
 # Copy example env and provide your API key
 cp .env.example .env
-# Edit .env to set OPENAI_API_KEY and other values
+# Edit .env to set GEMINI_API_KEY and other values
 
 # Run auto-build script
 chmod +x setup.sh

@@ -14,7 +14,7 @@ pip install -r requirements.txt
 2. **Configure API keys:**
 ```bash
 cp .env.template .env
-# Edit .env with your OpenAI API key
+# Edit .env with your Gemini API key (AIza...)
 ```
 
 3. **Build C library (optional):**
@@ -36,7 +36,7 @@ python main.py
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-3.5-turbo",
+    "model": "gemini-2.0-flash",
     "messages": [
       {
         "role": "user",
@@ -49,14 +49,14 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 ### How It Works
 
 1. **Tokenization**: Incoming PII (Aadhar, PAN, Phone) is detected and replaced with tokens like `[AADHAR_1000]`
-2. **API Forwarding**: The masked request is sent to OpenAI
+2. **API Forwarding**: The masked request is sent to Google Gemini
 3. **Rehydration**: AI response tokens are replaced with original PII values
 4. **Cleanup**: Vault is immediately cleared after response (zero-trust)
 
 ### Key Features
 
 - ✅ **PrivacyVault integration** with automatic tokenization
-- ✅ **Live OpenAI API calls** with secure key handling via .env
+- ✅ **Live Gemini API calls** with secure key handling via .env
 - ✅ **Rehydration loop** that restores original PII in responses
 - ✅ **Session cleanup** - vault purged after each request
 - ✅ **Fallback PII detection** if C library unavailable
@@ -65,10 +65,10 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ```bash
 # Required
-OPENAI_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
 
 # Optional
-DEFAULT_MODEL=gpt-3.5-turbo
+DEFAULT_MODEL=gemini-2.0-flash
 HOST=127.0.0.1
 PORT=8000
 ```

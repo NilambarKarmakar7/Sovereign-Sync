@@ -266,10 +266,10 @@ app = FastAPI(
 pii_processor = PIIProcessor()
 
 # API Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "https://api.openai.com/v1")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 LLM_CHAT_PATH = os.getenv("LLM_CHAT_PATH", "/chat/completions")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.0-flash")
 LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
 
 # HTTP client for API calls (reused for streaming)
@@ -302,7 +302,7 @@ async def health_check():
         "status": "healthy",
         "c_bridge_initialized": pii_processor.c_bridge.initialized,
         "llm_api_base_url": LLM_API_BASE_URL,
-        "openai_key": bool(OPENAI_API_KEY)
+        "gemini_key": bool(GEMINI_API_KEY)
     }
 
 
@@ -352,9 +352,9 @@ async def chat_completions(request: Request):
         model = body.get("model", DEFAULT_MODEL)
         stream = body.get("stream", False)
 
-        if not OPENAI_API_KEY:
+        if not GEMINI_API_KEY:
             return dpdp_error_response(
-                "LLM API key not configured. Set OPENAI_API_KEY in the .env file.",
+                "LLM API key not configured. Set GEMINI_API_KEY in the .env file.",
                 status_code=500
             )
 
@@ -414,9 +414,9 @@ async def chat_completions(request: Request):
             **{k: v for k, v in body.items() if k not in ["model", "messages"]}
         }
 
-        # Forward to OpenAI
+        # Forward to Gemini (OpenAI-compatible endpoint)
         headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Authorization": f"Bearer {GEMINI_API_KEY}",
             "Content-Type": "application/json"
         }
 
@@ -424,7 +424,7 @@ async def chat_completions(request: Request):
         if stream:
             response_session_id = header_session_id or session_id
             return StreamingResponse(
-                stream_openai_response(api_request, headers, session_id, clear_after_response),
+                stream_gemini_response(api_request, headers, session_id, clear_after_response),
                 media_type="text/plain",
                 headers={"X-Sovereign-Session-ID": response_session_id}
             )
@@ -471,8 +471,8 @@ async def chat_completions(request: Request):
         return dpdp_error_response("Internal server error", status_code=500)
 
 
-async def stream_openai_response(api_request: dict, headers: dict, session_id: str, clear_after_response: bool) -> AsyncGenerator[str, None]:
-    """Stream OpenAI response with real-time PII rehydration."""
+async def stream_gemini_response(api_request: dict, headers: dict, session_id: str, clear_after_response: bool) -> AsyncGenerator[str, None]:
+    """Stream Gemini response with real-time PII rehydration."""
 
     partial_token_tail = ""
 
